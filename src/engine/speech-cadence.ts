@@ -57,7 +57,10 @@ export interface PluginVoicePlayback {
 export interface PluginVoice {
   readonly playback: ReadonlyVoiceStore<PluginVoicePlayback>;
   readonly timeline: ReadonlyVoiceStore<VoiceTimeline>;
-  /** Smoothed loudness (0..1) of what is playing now; 0 when idle. */
+  /**
+   * Loudness (0..1) of what is playing now, measured at the audio graph, so it runs ahead of the
+   * listener by `outputLatencyMs()`; ordinary speech is about 0.1 to 0.3. 0 when idle.
+   */
   level(): number;
   /** The host's output-latency estimate, already folded into the timeline times. */
   outputLatencyMs(): number;
@@ -165,6 +168,8 @@ export interface SpeechCadence {
   /** Start mouthing a reply; an empty string leaves the current one to finish. Unused with a voice source. */
   noteReply(spoken: string): void;
   sample(dtSec: number): SpeechSample;
+  /** Stop listening to the host's voice source. */
+  dispose(): void;
 }
 
 export interface SpeechCadenceOptions {
@@ -176,9 +181,11 @@ export interface SpeechCadenceOptions {
 
 const SILENT: SpeechSample = { speaking: false, level: 0, visemes: NONE };
 /** Loudness below this is treated as silence. */
-const LEVEL_FLOOR = 0.02;
-/** Loudness at and above this opens the mouth fully. */
-const LEVEL_FULL = 0.3;
+const LEVEL_FLOOR = 0.04;
+/** Loudness at and above this opens the mouth fully; ordinary speech reaches about 0.1 to 0.3. */
+const LEVEL_FULL = 0.25;
+/** How much loudness history is kept beyond the output latency, for frame gaps. */
+const LEVEL_HISTORY_MS = 250;
 
 /** Mouth openness allowed by the current loudness (0..1). */
 function levelGain(level: number): number {
@@ -213,10 +220,42 @@ function sampleLayout(layout: PieceLayout, atMs: number): Segment | null {
   return steps.find((step) => step.end > at) ?? null;
 }
 
+/**
+ * Recent loudness readings, so the level can be read when the listener hears it rather than when
+ * the audio graph produced it.
+ */
+function createLevelHistory() {
+  const readings: Array<{ readonly atMs: number; readonly level: number }> = [];
+  return {
+    /** Add a reading, keeping enough history to look `keepMs` back from it. */
+    record(atMs: number, level: number, keepMs: number): void {
+      readings.push({ atMs, level: Number.isFinite(level) ? level : 0 });
+      // Keep one reading at or before the oldest time still needed, and drop the rest.
+      while (readings.length > 1 && readings[1]!.atMs <= atMs - keepMs) readings.shift();
+    },
+    /** The latest reading taken at or before `atMs`; 0 if none is that old. */
+    at(atMs: number): number {
+      for (let i = readings.length - 1; i >= 0; i--) {
+        if (readings[i]!.atMs <= atMs) return readings[i]!.level;
+      }
+      return 0;
+    },
+  };
+}
+
 function createVoiceCadence(voice: PluginVoice, now: () => number): SpeechCadence {
-  let wasSpeaking = false;
   let layout: PieceLayout | null = null;
   let clockSec = 0;
+  const levels = createLevelHistory();
+  // Every playback change is seen here, including ones that come and go between two frames.
+  let lastStatus = voice.playback.get().status;
+  let pendingCut = false;
+  const stopListening = voice.playback.listen((playback) => {
+    if (lastStatus === 'speaking' && playback.status !== 'speaking' && playback.endReason !== 'finished') {
+      pendingCut = true;
+    }
+    lastStatus = playback.status;
+  });
 
   function timedSample(segments: readonly SpokenSegment[], atMs: number, gain: number): SpeechSample | null {
     let anyTimed = false;
@@ -248,22 +287,32 @@ function createVoiceCadence(voice: PluginVoice, now: () => number): SpeechCadenc
 
     sample(dtSec: number): SpeechSample {
       clockSec += Math.max(0, Math.min(0.1, dtSec));
-      const playback = voice.playback.get();
-      if (playback.status !== 'speaking') {
-        const cut = wasSpeaking && playback.endReason !== 'finished';
-        wasSpeaking = false;
+      const nowMs = now();
+      const reportedLatencyMs = voice.outputLatencyMs();
+      const latencyMs = Number.isFinite(reportedLatencyMs) && reportedLatencyMs > 0 ? reportedLatencyMs : 0;
+      levels.record(nowMs, voice.level(), latencyMs + LEVEL_HISTORY_MS);
+      if (pendingCut) {
+        pendingCut = false;
         layout = null;
-        return cut ? { ...SILENT, cut: true } : SILENT;
+        return { ...SILENT, cut: true };
       }
-      wasSpeaking = true;
-      const gain = levelGain(voice.level());
-      const atMs = now() + SPEECH_RENDER_LEAD_MS;
+      if (voice.playback.get().status !== 'speaking') {
+        layout = null;
+        return SILENT;
+      }
+      const atMs = nowMs + SPEECH_RENDER_LEAD_MS;
+      // The level is measured ahead of the listener; read it as it is being heard.
+      const gain = levelGain(levels.at(atMs - latencyMs));
       const timed = timedSample(voice.timeline.get().segments, atMs, gain);
       if (timed) return timed;
       // Loudness only: openness follows the level through a plain rotation of vowel shapes.
       const open = 0.85 * gain;
       const vowel: Vowel = (['aa', 'oh', 'ee', 'ih', 'ou'] as const)[Math.floor(clockSec * 4) % 5]!;
       return { speaking: true, level: open, visemes: open > 0 ? { ...NONE, [vowel]: open } : NONE };
+    },
+
+    dispose(): void {
+      stopListening();
     },
   };
 }
@@ -290,6 +339,8 @@ function createTextCadence(): SpeechCadence {
       index = 0;
       start = clock + LEAD_IN_SEC;
     },
+
+    dispose(): void {},
 
     sample(dtSec: number): SpeechSample {
       clock += Math.max(0, Math.min(0.1, dtSec));

@@ -1025,6 +1025,7 @@ export function createStageRenderer(options: StageRendererOptions): StageRendere
     dispose(): void {
       if (disposed) return;
       disposed = true;
+      speechCadence.dispose();
       if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
         window.removeEventListener('pointermove', onWindowPointerMove);
         window.removeEventListener(MODEL_TUNING_EVENT, onModelTuning);

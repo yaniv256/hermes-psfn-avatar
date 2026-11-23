@@ -185,12 +185,19 @@ function fakeVoice() {
   const playback = store(idle);
   const timeline = store({ segments: [] });
   let level = 0;
+  let latencyMs = 0;
   return {
     door: {
       playback,
       timeline,
       level: () => level,
-      outputLatencyMs: () => 0,
+      outputLatencyMs: () => latencyMs,
+    },
+    setLatency(next) {
+      latencyMs = next;
+    },
+    put(next) {
+      playback.put({ source: 'chained', messageId: 'm1', endReason: null, endDetail: null, ...next });
     },
     speak() {
       playback.put({ status: 'speaking', source: 'chained', messageId: 'm1', endReason: null, endDetail: null });
@@ -377,5 +384,123 @@ test('with a voice door present but idle, reply text alone does not move the mou
     const sample = cadence.sample(0.016);
     assert.equal(sample.speaking, false);
     assert.equal(maxViseme(sample), 0);
+  }
+});
+
+test('the level scale opens the mouth for ordinary speech and keeps it shut on noise', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  voice.setTimeline([]);
+  voice.speak();
+  const openAt = (level) => {
+    voice.setLevel(level);
+    now += 16;
+    return cadence.sample(0.016).level;
+  };
+  assert.equal(openAt(0.03), 0, 'background noise stays closed');
+  const ordinary = openAt(0.2);
+  assert.ok(ordinary >= 0.6, `ordinary speech opens the mouth: ${ordinary}`);
+  assert.ok(openAt(0.1) > 0.15, 'quiet speech still opens it a little');
+  assert.equal(openAt(1), 0.85, 'loud speech opens it fully');
+});
+
+test('the level is read on the listener clock, delayed by the output latency', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  voice.setLatency(200);
+  voice.setTimeline([
+    {
+      text: 'aaaaaaaaaaaa',
+      startMs: 0,
+      endMs: 5000,
+      pieces: [{ text: 'aaaaaaaaaaaa', kind: 'fragment', startMs: 0, endMs: 5000 }],
+    },
+  ]);
+  voice.speak();
+  voice.setLevel(0);
+  for (now = 0; now < 1000; now += 16) cadence.sample(0.016);
+  // The audio graph gets loud at 1000 ms; the listener hears it 200 ms later.
+  voice.setLevel(0.5);
+  const heard = [];
+  for (; now < 1400; now += 16) heard.push([now, cadence.sample(0.016).level]);
+  for (const [t, level] of heard) {
+    if (t < 1190) assert.equal(level, 0, `still silent for the listener at ${t}ms`);
+    if (t >= 1216) assert.ok(level > 0.5, `heard at ${t}ms: ${level}`);
+  }
+  // Loudness alone follows the same delay.
+  voice.setTimeline([]);
+  voice.setLevel(0);
+  const quietFrom = now;
+  for (; now < quietFrom + 400; now += 16) {
+    const level = cadence.sample(0.016).level;
+    if (now < quietFrom + 190) assert.ok(level > 0.5, `still loud for the listener at ${now - quietFrom}ms after`);
+    if (now >= quietFrom + 216) assert.equal(level, 0, `quiet at ${now - quietFrom}ms after`);
+  }
+});
+
+test('end reasons are taken from every playback change, not the frame-time state', async () => {
+  const mod = await importSpeechCadence();
+  const open = async (voice, cadence, clock) => {
+    voice.setTimeline([]);
+    voice.setLevel(0.4);
+    voice.speak();
+    for (let i = 0; i < 5; i++) {
+      clock.now += 16;
+      assert.equal(cadence.sample(0.016).cut, undefined);
+    }
+  };
+
+  // A newer reply replaces the old one between two frames: the mouth still closes at once.
+  {
+    const voice = fakeVoice();
+    const clock = { now: 0 };
+    const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => clock.now });
+    await open(voice, cadence, clock);
+    voice.end('replaced');
+    voice.put({ status: 'preparing', messageId: 'm2' });
+    voice.put({ status: 'speaking', messageId: 'm2' });
+    clock.now += 16;
+    assert.equal(cadence.sample(0.016).cut, true, 'replaced between frames is a cut');
+    clock.now += 16;
+    const next = cadence.sample(0.016);
+    assert.equal(next.cut, undefined);
+    assert.equal(next.speaking, true, 'the new reply is spoken');
+    cadence.dispose();
+  }
+
+  // Speech finishes and the next reply starts preparing between two frames: the mouth eases.
+  {
+    const voice = fakeVoice();
+    const clock = { now: 0 };
+    const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => clock.now });
+    await open(voice, cadence, clock);
+    voice.end('finished');
+    voice.put({ status: 'preparing', messageId: 'm2' });
+    clock.now += 16;
+    const sample = cadence.sample(0.016);
+    assert.equal(sample.speaking, false);
+    assert.equal(sample.cut, undefined, 'finished then preparing is not a cut');
+    cadence.dispose();
+  }
+
+  // After dispose the cadence stops listening.
+  {
+    const voice = fakeVoice();
+    let calls = 0;
+    const listen = voice.door.playback.listen;
+    voice.door.playback.listen = (cb) => {
+      const off = listen(cb);
+      return () => {
+        calls++;
+        off();
+      };
+    };
+    const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => 0 });
+    cadence.dispose();
+    assert.equal(calls, 1, 'unsubscribed on dispose');
   }
 });
