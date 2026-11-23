@@ -32,7 +32,7 @@ import {
 import { VRM_PRESET_FOR_BASE, type EmotionalBase } from './emotion-mapping.ts';
 import { createHoloAvatar, type HoloAvatarHandle } from './holo-avatar.ts';
 import { disposeAvatarScenes, loadAvatarFromArrayBuffer, LocalAvatarError } from './load-avatar.ts';
-import { createSpeechCadence } from './speech-cadence.ts';
+import { createMouth, createSpeechCadence, type PluginVoice } from './speech-cadence.ts';
 import { VrmClipPlayer, type BakedMotionClip, type ClipFetcher } from './vrm-clip-player.ts';
 
 export type CameraPreset = 'bust' | 'waist' | 'full';
@@ -126,7 +126,7 @@ export interface StagePlaybackState {
   readonly cameraPreset: CameraPreset;
   readonly speechText: string;
   readonly speechId: number;
-  /** The reply text being spoken; mouth shapes are laid out from its words and punctuation. */
+  /** The reply text being spoken; without a host voice source, mouth shapes are laid out from its words and punctuation. */
   readonly speechSpoken: string;
   readonly muted: boolean;
 }
@@ -136,6 +136,8 @@ export interface StageRendererOptions {
   readonly fetchClip: ClipFetcher;
   readonly fetchClipsManifest: () => Promise<ClipManifestEntry[]>;
   readonly onStatus?: (info: { format: string; state: string; error?: string }) => void;
+  /** The host's read-only voice source; without it the mouth is guessed from the reply text. */
+  readonly voice?: PluginVoice | null;
 }
 
 export interface StageRendererHandle {
@@ -154,7 +156,7 @@ export interface StageRendererHandle {
 const PRESET_EXPRESSIONS = ['happy', 'relaxed', 'surprised', 'sad', 'angry'] as const;
 
 export function createStageRenderer(options: StageRendererOptions): StageRendererHandle {
-  const { canvas, fetchClip, fetchClipsManifest, onStatus } = options;
+  const { canvas, fetchClip, fetchClipsManifest, onStatus, voice } = options;
 
   let renderer: WebGLRenderer;
   try {
@@ -190,7 +192,6 @@ export function createStageRenderer(options: StageRendererOptions): StageRendere
     speechLevel: 0,
   };
   let speechPhaseSec = 0;
-  let smoothedSpeechLevel = 0;
   const VOWELS = ['aa', 'ih', 'ou', 'ee', 'oh'] as const;
   const visemeWeights: Record<(typeof VOWELS)[number], number> = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
 
@@ -709,29 +710,26 @@ export function createStageRenderer(options: StageRendererOptions): StageRendere
     }
   }
 
-  const speechCadence = createSpeechCadence();
+  const speechCadence = createSpeechCadence({ voice });
+  const mouth = createMouth();
 
   function updateSpeechClock(dt: number): void {
-    // Drive talking animation & mouth visemes from the text of the current reply
-    const tts = speechCadence.sample(dt);
-    if (tts.speaking && !state.muted) {
+    // Drive talking animation & mouth visemes from the host's voice, or the text of the current reply
+    const sample = speechCadence.sample(dt);
+    const speaking = sample.speaking && !state.muted;
+    const shown = mouth.update(speaking ? sample : { ...sample, speaking: false }, dt);
+    for (const v of VOWELS) visemeWeights[v] = shown.visemes[v];
+    if (speaking) {
       if (companionPlayer?.mode === 'preview' && !state.reaction) {
         companionPlayer.setMode('auto');
       }
       speechPhaseSec += dt;
       audioClock.speechTime = speechPhaseSec;
-      const alpha = Math.min(1, Math.max(0.2, dt * 28));
-      smoothedSpeechLevel += (tts.level - smoothedSpeechLevel) * alpha;
-      const shape = Math.min(1, dt * 26);
-      for (const v of VOWELS) visemeWeights[v] += (tts.visemes[v] - visemeWeights[v]) * shape;
-      audioClock.speechLevel = Math.max(0.06, Math.min(1.0, smoothedSpeechLevel));
+      audioClock.speechLevel = Math.max(0.06, Math.min(1.0, shown.level));
       return;
     }
-
-    smoothedSpeechLevel = Math.max(0, smoothedSpeechLevel - dt * 10);
-    for (const v of VOWELS) visemeWeights[v] = Math.max(0, visemeWeights[v] - dt * 10);
-    audioClock.speechTime = smoothedSpeechLevel > 0.02 ? speechPhaseSec : null;
-    audioClock.speechLevel = smoothedSpeechLevel > 0.02 ? smoothedSpeechLevel : 0;
+    audioClock.speechTime = shown.talking ? speechPhaseSec : null;
+    audioClock.speechLevel = shown.talking ? shown.level : 0;
   }
 
   function applyCursorGaze(dt: number, expr: ExpressionAdapter | null): void {

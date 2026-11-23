@@ -146,3 +146,236 @@ test('desktop/plugin.js and dashboard/dist/index.js bundles exist and stay under
   assert.equal(desktopSizeKb < 1024, true, `desktop/plugin.js is ${desktopSizeKb}KB`);
   assert.equal(dashboardSizeKb < 1024, true, `dashboard/dist/index.js is ${dashboardSizeKb}KB`);
 });
+
+async function importSpeechCadence() {
+  const bundled = await build({
+    entryPoints: [path.join(ROOT, 'src', 'engine', 'speech-cadence.ts')],
+    bundle: true,
+    write: false,
+    format: 'esm',
+    platform: 'node',
+  });
+  const code = bundled.outputFiles[0].text;
+  return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+}
+
+/** A stand-in for the host's read-only voice door, driven by the test. */
+function fakeVoice() {
+  const store = (initial) => {
+    let value = initial;
+    const subs = new Set();
+    return {
+      get: () => value,
+      subscribe(cb) {
+        subs.add(cb);
+        cb(value);
+        return () => subs.delete(cb);
+      },
+      listen(cb) {
+        subs.add(cb);
+        return () => subs.delete(cb);
+      },
+      put(next) {
+        value = next;
+        for (const cb of subs) cb(value);
+      },
+    };
+  };
+  const idle = { status: 'idle', source: null, messageId: null, endReason: null, endDetail: null };
+  const playback = store(idle);
+  const timeline = store({ segments: [] });
+  let level = 0;
+  return {
+    door: {
+      playback,
+      timeline,
+      level: () => level,
+      outputLatencyMs: () => 0,
+    },
+    speak() {
+      playback.put({ status: 'speaking', source: 'chained', messageId: 'm1', endReason: null, endDetail: null });
+    },
+    end(endReason) {
+      playback.put({ status: 'idle', source: null, messageId: null, endReason, endDetail: null });
+    },
+    setTimeline(segments) {
+      timeline.put({ segments });
+    },
+    setLevel(next) {
+      level = next;
+    },
+  };
+}
+
+const maxViseme = (sample) => Math.max(...Object.values(sample.visemes));
+
+test('without a voice door the mouth follows the text-guess timeline', async () => {
+  const mod = await importSpeechCadence();
+  const text = 'Hello there, my friend! How are you doing today?';
+  const segments = mod.buildTimeline(text);
+  const cadence = mod.createSpeechCadence();
+  const dt = 0.02;
+  cadence.sample(dt);
+  let clock = dt;
+  cadence.noteReply(text);
+  const start = clock + 0.7;
+  let mouthed = 0;
+  for (let i = 0; i < 400; i++) {
+    const sample = cadence.sample(dt);
+    clock += dt;
+    const at = clock - start;
+    const seg = at >= 0 ? segments.find((s) => s.end > at) : undefined;
+    if (!seg) {
+      assert.equal(sample.speaking, false, `silent at ${at.toFixed(2)}s`);
+      continue;
+    }
+    assert.equal(sample.speaking, true, `speaking at ${at.toFixed(2)}s`);
+    assert.equal(sample.level, seg.open);
+    for (const v of ['aa', 'ih', 'ou', 'ee', 'oh']) {
+      assert.equal(sample.visemes[v], seg.vowel === v ? seg.open : 0, `${v} at ${at.toFixed(2)}s`);
+    }
+    if (maxViseme(sample) > 0) mouthed++;
+  }
+  assert.ok(mouthed > 50);
+});
+
+test('a timed word piece shapes the mouth only inside its window', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  voice.setTimeline([
+    {
+      text: 'hello',
+      startMs: 1000,
+      endMs: 1400,
+      pieces: [{ text: 'hello', kind: 'word', startMs: 1000, endMs: 1400, charStart: 0, charEnd: 5 }],
+    },
+  ]);
+  voice.setLevel(0.5);
+  voice.speak();
+  // A text-guess reply must not override the timed pieces.
+  cadence.noteReply('This reply text should not drive the mouth at all.');
+  let firstEe = Infinity;
+  let lastOh = -Infinity;
+  for (now = 800; now <= 1600; now += 5) {
+    const sample = cadence.sample(0.005);
+    assert.equal(sample.speaking, true);
+    const inside = now >= 1000 && now < 1400;
+    if (!inside) {
+      assert.equal(maxViseme(sample), 0, `closed at ${now}ms`);
+      continue;
+    }
+    if (sample.visemes.ee > 0.3) firstEe = Math.min(firstEe, now);
+    if (sample.visemes.oh > 0.3) lastOh = Math.max(lastOh, now);
+  }
+  // The word's sounds are spread across the piece: "e" early, "o" late.
+  assert.ok(firstEe >= 1000 && firstEe < 1200, `ee first at ${firstEe}`);
+  assert.ok(lastOh > 1250 && lastOh < 1400, `oh last at ${lastOh}`);
+});
+
+test('with loudness but no timed pieces, mouth openness follows the level', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  voice.setTimeline([
+    {
+      text: 'A whole sentence.',
+      startMs: 0,
+      endMs: Infinity,
+      pieces: [{ text: 'A whole sentence.', kind: 'sentence', startMs: 0, endMs: Infinity }],
+    },
+  ]);
+  voice.speak();
+  const openness = [];
+  for (const level of [0, 0.05, 0.1, 0.2, 0.3]) {
+    voice.setLevel(level);
+    now += 16;
+    const sample = cadence.sample(0.016);
+    assert.equal(sample.speaking, true);
+    openness.push(sample.level);
+    assert.equal(maxViseme(sample) > 0, level > 0, `shape at level ${level}`);
+  }
+  assert.ok(openness[0] < 0.02, `closed at level 0: ${openness[0]}`);
+  for (let i = 1; i < openness.length; i++) assert.ok(openness[i] > openness[i - 1], `rises with the level: ${openness}`);
+  assert.ok(openness[openness.length - 1] > 0.5);
+
+  // An empty timeline behaves the same way.
+  voice.setTimeline([]);
+  voice.setLevel(0.3);
+  now += 16;
+  assert.ok(cadence.sample(0.016).level > 0.5);
+});
+
+test('a piece still open while the audio is silent keeps the mouth nearly closed', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  voice.setTimeline([
+    {
+      text: 'later',
+      startMs: 0,
+      endMs: 600,
+      pieces: [{ text: 'later', kind: 'fragment', startMs: 0, endMs: 600 }],
+    },
+  ]);
+  voice.speak();
+  voice.setLevel(0.003);
+  for (now = 0; now < 600; now += 10) {
+    const sample = cadence.sample(0.01);
+    assert.ok(maxViseme(sample) < 0.05, `near closed at ${now}ms: ${maxViseme(sample)}`);
+    assert.ok(sample.level < 0.05);
+  }
+});
+
+test('interrupted speech closes the mouth at once; finished speech eases it shut', async () => {
+  const mod = await importSpeechCadence();
+  for (const endReason of ['interrupted', 'stopped', 'replaced', 'closed', 'finished']) {
+    const voice = fakeVoice();
+    let now = 0;
+    const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+    const mouth = mod.createMouth();
+    voice.setTimeline([]);
+    voice.setLevel(0.4);
+    voice.speak();
+    let state;
+    for (let i = 0; i < 20; i++) {
+      now += 16;
+      state = mouth.update(cadence.sample(0.016), 0.016);
+    }
+    assert.ok(maxViseme(state) > 0.2, `open before ${endReason}`);
+    voice.setLevel(0);
+    voice.end(endReason);
+    now += 16;
+    state = mouth.update(cadence.sample(0.016), 0.016);
+    if (endReason === 'finished') {
+      assert.ok(maxViseme(state) > 0.05, `finished eases: ${maxViseme(state)}`);
+      assert.ok(state.level > 0.05);
+      for (let i = 0; i < 20; i++) {
+        now += 16;
+        state = mouth.update(cadence.sample(0.016), 0.016);
+      }
+      assert.equal(maxViseme(state), 0, 'finished ends closed');
+    } else {
+      assert.equal(maxViseme(state), 0, `${endReason} closes at once`);
+      assert.equal(state.level, 0);
+      assert.equal(state.talking, false);
+    }
+  }
+});
+
+test('with a voice door present but idle, reply text alone does not move the mouth', async () => {
+  const mod = await importSpeechCadence();
+  const voice = fakeVoice();
+  let now = 0;
+  const cadence = mod.createSpeechCadence({ voice: voice.door, now: () => now });
+  cadence.noteReply('Hello there, my friend!');
+  for (let i = 0; i < 200; i++) {
+    now += 16;
+    const sample = cadence.sample(0.016);
+    assert.equal(sample.speaking, false);
+    assert.equal(maxViseme(sample), 0);
+  }
+});
