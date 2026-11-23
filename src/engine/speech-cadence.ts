@@ -92,8 +92,30 @@ interface Segment {
 }
 
 const NONE: Readonly<Record<Vowel, number>> = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
-/** How wide each vowel opens the mouth. */
-const OPEN: Readonly<Record<Vowel, number>> = { aa: 0.85, oh: 0.7, ou: 0.55, ee: 0.55, ih: 0.5 };
+/** How strongly each vowel sound is articulated (before loudness). */
+const OPEN: Readonly<Record<Vowel, number>> = { aa: 0.95, oh: 0.95, ou: 0.95, ee: 0.95, ih: 0.95 };
+
+/**
+ * The avatar's five mouth shapes, blended per vowel sound so the openings keep the order of human vowel
+ * height: open "a" (car) > open-mid "o" (thought) > "e" (bed) > near-close "i" (tip) > close, rounded "u"
+ * (too). Measured on a VRoid face, at full strength the openings are about 1, 0.78, 0.6, 0.41 and 0.37 of
+ * "a". "i" borrows some "a" because the VRM "ih" shape alone barely parts the lips.
+ */
+const SHAPES: Readonly<Record<Vowel, Readonly<Partial<Record<Vowel, number>>>>> = {
+  aa: { aa: 1 },
+  oh: { oh: 0.8 },
+  ee: { ee: 0.95 },
+  ih: { ih: 1, aa: 0.3 },
+  ou: { ou: 1 },
+};
+
+/** The avatar's shape weights for a vowel sound articulated at `open` (0..1). */
+export function shapeVisemes(vowel: Vowel | null, open: number): Record<Vowel, number> {
+  const out: Record<Vowel, number> = { ...NONE };
+  if (!vowel || !(open > 0)) return out;
+  for (const [v, w] of Object.entries(SHAPES[vowel]) as Array<[Vowel, number]>) out[v] = Math.min(1, w * open);
+  return out;
+}
 /** Letters spoken per second by the text-to-speech voices Hermes ships with. */
 const LETTERS_PER_SECOND = 15.5;
 /** Text-to-speech needs a moment to synthesize before any sound plays. */
@@ -127,11 +149,17 @@ function wordSteps(word: string): Array<[Vowel | null, number, number]> {
     } else if ('bmp'.includes(c)) {
       steps.push([null, 0.7, 0]); // lips meet
     } else if ('fv'.includes(c)) {
-      steps.push(['ih', 0.6, 0.18]);
+      steps.push(['ih', 0.6, 0.18]); // upper teeth on the lower lip
     } else if (c === 'w') {
-      steps.push(['ou', 0.6, 0.3]);
+      steps.push(['ou', 0.6, 0.35]); // rounded, nearly closed
+    } else if (c === 'r') {
+      steps.push(['ou', 0.5, 0.4]); // slightly rounded
+    } else if ('szcx'.includes(c)) {
+      steps.push(['ih', 0.5, 0.35]); // teeth close, lips spread
+    } else if (c === 'l' || c === 'h') {
+      steps.push([last, 0.5, 0.55]); // the tongue moves; the jaw stays open
     } else {
-      steps.push([last, 0.5, 0.2]); // other consonants: the mouth narrows but stays in shape
+      steps.push([last, 0.5, 0.4]); // t, d, n, k, g, ...: the mouth narrows but stays in shape
     }
   }
   return steps;
@@ -184,13 +212,18 @@ const SILENT: SpeechSample = { speaking: false, level: 0, visemes: NONE };
 const LEVEL_FLOOR = 0.04;
 /** Loudness at and above this opens the mouth fully; ordinary speech reaches about 0.1 to 0.3. */
 const LEVEL_FULL = 0.25;
+/** Exponent of the loudness curve: 1 is linear; below 1 opens quieter speech more. */
+const LEVEL_CURVE = 0.6;
 /** How much loudness history is kept beyond the output latency, for frame gaps. */
 const LEVEL_HISTORY_MS = 250;
 
-/** Mouth openness allowed by the current loudness (0..1). */
+/**
+ * Mouth openness allowed by the current loudness (0..1). The curve is concave, so ordinary speech opens the
+ * mouth most of the way instead of reading as a whisper; noise below the floor still keeps it shut.
+ */
 function levelGain(level: number): number {
   if (!Number.isFinite(level)) return 0;
-  return Math.max(0, Math.min(1, (level - LEVEL_FLOOR) / (LEVEL_FULL - LEVEL_FLOOR)));
+  return Math.max(0, Math.min(1, (level - LEVEL_FLOOR) / (LEVEL_FULL - LEVEL_FLOOR))) ** LEVEL_CURVE;
 }
 
 function isTimed(piece: SpokenPiece): boolean {
@@ -273,7 +306,7 @@ function createVoiceCadence(voice: PluginVoice, now: () => number): SpeechCadenc
         const step = sampleLayout(current, atMs);
         if (!step) continue;
         const open = step.open * gain;
-        return { speaking: true, level: open, visemes: step.vowel ? { ...NONE, [step.vowel]: open } : NONE };
+        return { speaking: true, level: open, visemes: shapeVisemes(step.vowel, open) };
       }
     }
     // Between timed pieces the voice is silent.
@@ -308,7 +341,7 @@ function createVoiceCadence(voice: PluginVoice, now: () => number): SpeechCadenc
       // Loudness only: openness follows the level through a plain rotation of vowel shapes.
       const open = 0.85 * gain;
       const vowel: Vowel = (['aa', 'oh', 'ee', 'ih', 'ou'] as const)[Math.floor(clockSec * 4) % 5]!;
-      return { speaking: true, level: open, visemes: open > 0 ? { ...NONE, [vowel]: open } : NONE };
+      return { speaking: true, level: open, visemes: shapeVisemes(vowel, open) };
     },
 
     dispose(): void {
@@ -348,10 +381,7 @@ function createTextCadence(): SpeechCadence {
       if (start >= 0 && at >= 0 && timeline.length > 0) {
         while (index < timeline.length && timeline[index]!.end <= at) index++;
         const seg = timeline[index];
-        if (seg) {
-          const visemes = seg.vowel ? { ...NONE, [seg.vowel]: seg.open } : NONE;
-          return { speaking: true, level: seg.open, visemes };
-        }
+        if (seg) return { speaking: true, level: seg.open, visemes: shapeVisemes(seg.vowel, seg.open) };
         timeline = [];
       }
       const webSpeech =
@@ -362,7 +392,7 @@ function createTextCadence(): SpeechCadence {
       // No text to follow here: fall back to a plain syllable rhythm.
       const level = Math.max(0.1, 0.5 + 0.32 * Math.sin(clock * Math.PI * 2 * 5.2) + 0.2 * Math.sin(clock * Math.PI * 2 * 8.3));
       const vowel: Vowel = (['aa', 'oh', 'ee', 'ih', 'ou'] as const)[Math.floor(clock * 4) % 5]!;
-      return { speaking: true, level: Math.min(0.9, level), visemes: { ...NONE, [vowel]: Math.min(0.9, level) } };
+      return { speaking: true, level: Math.min(0.9, level), visemes: shapeVisemes(vowel, Math.min(0.9, level)) };
     },
   };
 }

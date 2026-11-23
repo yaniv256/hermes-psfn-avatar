@@ -238,8 +238,9 @@ test('without a voice door the mouth follows the text-guess timeline', async () 
     }
     assert.equal(sample.speaking, true, `speaking at ${at.toFixed(2)}s`);
     assert.equal(sample.level, seg.open);
+    const shape = mod.shapeVisemes(seg.vowel, seg.open);
     for (const v of ['aa', 'ih', 'ou', 'ee', 'oh']) {
-      assert.equal(sample.visemes[v], seg.vowel === v ? seg.open : 0, `${v} at ${at.toFixed(2)}s`);
+      assert.equal(sample.visemes[v], shape[v], `${v} at ${at.toFixed(2)}s`);
     }
     if (maxViseme(sample) > 0) mouthed++;
   }
@@ -503,4 +504,22 @@ test('end reasons are taken from every playback change, not the frame-time state
     cadence.dispose();
     assert.equal(calls, 1, 'unsubscribed on dispose');
   }
+});
+
+test('vowel shapes open in the order of human vowel height; lips meet on m, b and p', async () => {
+  const mod = await importSpeechCadence();
+  // Strength of the open shapes, weighted by how far each VRM shape opens a VRoid mouth at full weight.
+  const aperture = (w) => w.aa * 1 + w.oh * 0.96 + w.ee * 0.67 + w.ih * 0.18 + w.ou * 0.37;
+  const at = (vowel) => aperture(mod.shapeVisemes(vowel, 1));
+  assert.ok(at('aa') > at('oh') && at('oh') > at('ee') && at('ee') > at('ih') && at('ih') >= at('ou'), 'a > o > e > i >= u');
+  assert.ok(at('ih') > 0.3, `"i" visibly parts the lips: ${at('ih')}`);
+  assert.equal(aperture(mod.shapeVisemes(null, 1)), 0);
+  for (const word of ['map', 'bob', 'pump']) {
+    const steps = mod.buildTimeline(word);
+    const closed = steps.filter((s) => s.vowel === null && s.open === 0).length;
+    assert.ok(closed >= [...word].filter((c) => 'bmp'.includes(c)).length, `${word}: closed lips on every m/b/p`);
+  }
+  // Ordinary consonants keep the jaw open enough to read as speech, not a mumble.
+  const t = mod.buildTimeline('tat').find((s) => s.vowel === 'aa' && s.open < 0.9);
+  assert.ok(t && t.open >= 0.35, `"t" keeps the mouth open: ${t?.open}`);
 });
