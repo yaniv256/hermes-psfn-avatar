@@ -135,6 +135,62 @@ test('3D Holo-Rig, VrmClipPlayer, CompanionPlayer mood envelopes, and emotion ma
   holo.dispose();
 });
 
+test('clip motion reaches the trunk and head damped, and the root moves less, so the face stays in a close-up', async () => {
+  const bundled = await build({
+    stdin: {
+      contents: `export * from './src/engine/holo-avatar.ts'; export * from './src/engine/vrm-clip-player.ts'; export { Quaternion, Vector3 } from 'three';`,
+      resolveDir: ROOT,
+      loader: 'ts',
+    },
+    bundle: true,
+    write: false,
+    format: 'esm',
+    platform: 'node',
+  });
+  const mod = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
+  const clipsDir = path.join(ROOT, 'clips');
+  const fetchClip = async (url) => JSON.parse(fs.readFileSync(path.join(clipsDir, path.basename(url)), 'utf8'));
+
+  // the forward lean: head and chest swing far from rest, and the root travels
+  async function poseAt(trunkMotion, rootMotion, clipScale) {
+    const holo = mod.createHoloAvatar();
+    const hips = holo.getBoneNode('hips');
+    const head = holo.getBoneNode('head');
+    const arm = holo.getBoneNode('leftUpperArm');
+    const restHead = head.getWorldQuaternion(new mod.Quaternion());
+    const restHips = hips.position.clone();
+    const player = new mod.VrmClipPlayer((n) => holo.getBoneNode(n), hips.position, fetchClip);
+    if (trunkMotion) player.trunkMotion = trunkMotion;
+    if (rootMotion !== undefined) player.rootMotion = rootMotion;
+    await player.load('./clips/Neutral_Listening_01.json');
+    if (clipScale !== undefined) player.clipScale = clipScale;
+    player.play({ loop: true });
+    let headDev = 0, rootDev = 0;
+    for (let i = 0; i < 160; i++) {
+      player.update(0.05);
+      holo.scene.updateMatrixWorld(true);
+      headDev = Math.max(headDev, head.getWorldQuaternion(new mod.Quaternion()).angleTo(restHead));
+      rootDev = Math.max(rootDev, hips.position.distanceTo(restHips));
+    }
+    const armQ = arm.getWorldQuaternion(new mod.Quaternion());
+    holo.dispose();
+    return { headDev, rootDev, armQ };
+  }
+  const full = Object.fromEntries(Object.keys(mod.DEFAULT_TRUNK_MOTION).map((k) => [k, 1]));
+  const raw = await poseAt(full, 1, 1);
+  const damped = await poseAt();
+  const k = mod.clipMotionScale('./clips/Neutral_Listening_01.json');
+  assert.ok(k > 0 && k < 1, `the lean clip has its own extra damping (${k})`);
+  assert.equal(mod.clipMotionScale('./clips/Neutral_Idle_01.json'), 1);
+  assert.ok(raw.headDev > 0.5, `the lean clip turns the head well away from rest (${raw.headDev})`);
+  const headShare = mod.DEFAULT_TRUNK_MOTION.head * k;
+  const headRatio = damped.headDev / raw.headDev;
+  assert.ok(Math.abs(headRatio - headShare) < 0.1, `head motion is damped to its share (${headRatio} vs ${headShare})`);
+  const rootRatio = damped.rootDev / raw.rootDev;
+  assert.ok(Math.abs(rootRatio - mod.DEFAULT_ROOT_MOTION * k) < 0.02, `root travel is scaled (${rootRatio})`);
+  assert.ok(damped.armQ.angleTo(raw.armQ) < 1e-6, 'arms keep the full clip');
+});
+
 test('desktop/plugin.js and dashboard/dist/index.js bundles exist and stay under 1MB', () => {
   const desktopBundle = path.join(ROOT, 'desktop', 'plugin.js');
   const dashboardBundle = path.join(ROOT, 'dashboard', 'dist', 'index.js');

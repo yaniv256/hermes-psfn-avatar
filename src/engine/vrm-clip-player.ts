@@ -53,6 +53,40 @@ export const BONE_MAP: Readonly<Record<string, string | null>> = {
   LeftToeBase: 'leftToes',
 };
 
+/**
+ * How much of each clip's motion reaches the trunk and head. The clips are full-body motion capture, framed for a
+ * whole figure; at a face close-up their head turns, bows and forward leans carry the face out of frame. Each
+ * factor scales the bone's world-space rotation away from its rest pose (1 = as captured, 0 = held at rest). Arms and
+ * legs keep the full clip.
+ */
+export const DEFAULT_TRUNK_MOTION: Readonly<Record<string, number>> = {
+  hips: 0.5,
+  spine: 0.5,
+  chest: 0.5,
+  upperChest: 0.5,
+  neck: 0.45,
+  head: 0.4,
+};
+
+/** Share of the clip's root translation (sway, steps, leaning toward the camera) that moves the hips. */
+export const DEFAULT_ROOT_MOTION = 0.3;
+
+/**
+ * Extra damping for clips whose trunk motion is large even after DEFAULT_TRUNK_MOTION, keyed by clip file name
+ * (without .json). It multiplies both the trunk/head shares and the root share. Neutral_Listening_01 is a
+ * "leaning in" listen: the head bows about 50 degrees and the hips move forward by 14% of their height, which at a
+ * face close-up pushes the face toward the camera until the chin leaves the frame.
+ */
+export const CLIP_MOTION_SCALE: Readonly<Record<string, number>> = {
+  Neutral_Listening_01: 0.5,
+};
+
+/** CLIP_MOTION_SCALE entry for a clip URL, or 1. */
+export function clipMotionScale(url: string): number {
+  const name = url.split(/[?#]/)[0]!.split('/').pop()!.replace(/\.json$/i, '');
+  return CLIP_MOTION_SCALE[name] ?? 1;
+}
+
 export interface BakedMotionClip {
   readonly bones: readonly string[];
   readonly frames: number;
@@ -85,6 +119,12 @@ export class VrmClipPlayer {
   loop = true;
   /** Per-model multiplier for WORLD_ARM_CLEARANCE_OFFSETS (0 = raw clip arms, 1 = default spread). */
   armClearance = 1;
+  /** Per-bone share of the clip's trunk/head rotation; see DEFAULT_TRUNK_MOTION. */
+  trunkMotion: Record<string, number> = { ...DEFAULT_TRUNK_MOTION };
+  /** Share of the clip's root translation; see DEFAULT_ROOT_MOTION. */
+  rootMotion = DEFAULT_ROOT_MOTION;
+  /** CLIP_MOTION_SCALE of the loaded clip, applied on top of trunkMotion and rootMotion. */
+  clipScale = 1;
 
   private _maps: BoneMapEntry[] = [];
   private _q = new Quaternion();
@@ -186,6 +226,7 @@ export class VrmClipPlayer {
     if (sequence !== this._loadSequence) return this;
     this.clip = clip;
     this.url = url;
+    this.clipScale = clipMotionScale(url);
     this._maps = [];
     const bones = clip.bones;
     for (let i = 0; i < bones.length; i++) {
@@ -261,7 +302,12 @@ export class VrmClipPlayer {
       if (blend) {
         q0.slerp(q1.fromArray(this.clip.globalQuat[0]![m.coreIdx]!).normalize(), blend);
       }
-      const targetGlobal = q0.clone().multiply(m.coreRestInv).multiply(m.vrmRestGlobal);
+      // world-space rotation away from rest, damped for the trunk and head
+      const delta = q0.clone().multiply(m.coreRestInv);
+      const base = this.trunkMotion[m.vrmName];
+      const share = base === undefined ? undefined : base * this.clipScale;
+      if (share !== undefined && share !== 1) delta.copy(this._q3.identity().slerp(delta, Math.max(0, share)));
+      const targetGlobal = delta.multiply(m.vrmRestGlobal);
       const clearance = WORLD_ARM_CLEARANCE_OFFSETS[m.vrmName];
       if (clearance && this.armClearance > 0) {
         targetGlobal.premultiply(
@@ -282,7 +328,7 @@ export class VrmClipPlayer {
         const r1 = new Vector3().fromArray(this.clip.rootPos[f1]!);
         r0.lerp(r1, a).lerp(this._coreRoot0, blend).sub(this._coreRoot0);
         const scale = this._coreRoot0.y > 1e-4 ? this.hipsRestPos.y / this._coreRoot0.y : 1;
-        hips.node.position.copy(this.hipsRestPos).addScaledVector(r0, scale);
+        hips.node.position.copy(this.hipsRestPos).addScaledVector(r0, scale * Math.max(0, this.rootMotion * this.clipScale));
         if (fade?.root) {
           hips.node.position.lerpVectors(fade.root, hips.node.position, fadeWeight);
         }
